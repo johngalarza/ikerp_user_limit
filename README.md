@@ -7,4 +7,3 @@ Server-side enforcement of the internal-user cap for an IKERP SaaS tenant.
 - Enforced on `res.users.create`, reactivation, and portal→internal share flips.
 - Superuser (`uid=1`) is exempt so the orchestrator can operate freely.
 - Uninstall is blocked for all users except SUPERUSER_ID.
-# ikerp_user_limit
