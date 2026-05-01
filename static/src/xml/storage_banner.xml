@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+    <t t-name="ikerp_user_limit.StorageBanner">
+        <div t-if="state.visible"
+             class="ikerp-storage-banner"
+             t-att-class="'ikerp-storage-banner--' + state.level"
+             role="alert">
+            <span class="ikerp-storage-banner__icon" aria-hidden="true">
+                <t t-if="state.level === 'warning'">⚠</t>
+                <t t-elif="state.level === 'critical'">⚠</t>
+                <t t-else="">⛔</t>
+            </span>
+            <span class="ikerp-storage-banner__msg" t-out="message"/>
+        </div>
+    </t>
+</templates>

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data noupdate="1">
+        <record id="mail_template_storage_alert" model="mail.template">
+            <field name="name">IKERP: Storage quota alert</field>
+            <field name="model_id" ref="base.model_res_users"/>
+            <field name="subject">[IKERP] Almacenamiento al {{ ctx.get('ikerp_pct') }}% — acción requerida</field>
+            <field name="email_from">{{ (object.company_id.email or user.email or 'noreply@ikerp.com') }}</field>
+            <field name="email_to">{{ ctx.get('ikerp_admin_email') or object.email }}</field>
+            <field name="auto_delete" eval="True"/>
+            <field name="body_html" type="html">
+<div style="margin:0;padding:16px;font-family:Arial,Helvetica,sans-serif;color:#1f1f1f;">
+    <h2 style="margin:0 0 12px 0;color:#b00020;">Almacenamiento del plan</h2>
+    <p>Hola <t t-out="object.name or ''"/>,</p>
+    <p t-if="ctx.get('ikerp_state') == 'critical'">
+        Tu instancia ha alcanzado el
+        <strong><t t-out="ctx.get('ikerp_pct')"/>%</strong>
+        de almacenamiento
+        (<t t-out="ctx.get('ikerp_used_mb')"/> MB de
+        <t t-out="ctx.get('ikerp_limit_mb')"/> MB).
+        Si llegas al 100% no podrás crear nuevos adjuntos.
+    </p>
+    <p t-if="ctx.get('ikerp_state') == 'blocked'">
+        Tu instancia ha agotado el almacenamiento del plan
+        (<t t-out="ctx.get('ikerp_used_mb')"/> MB de
+        <t t-out="ctx.get('ikerp_limit_mb')"/> MB).
+        La creación de nuevos adjuntos está bloqueada hasta que liberes espacio
+        o amplíes el plan.
+    </p>
+    <p>Recomendaciones:</p>
+    <ul>
+        <li>Eliminar adjuntos antiguos que ya no se necesiten.</li>
+        <li>Vaciar la papelera de los módulos que la tengan.</li>
+        <li>Contactar a soporte para ampliar el plan.</li>
+    </ul>
+    <p style="margin-top:24px;color:#666;font-size:12px;">
+        Este mensaje es automático. No respondas a este correo.
+    </p>
+</div>
+            </field>
+        </record>
+    </data>
+</odoo>
