@@ -53,7 +53,7 @@ class TestStorageMeasurement(StorageTestBase):
         ):
             self.assertEqual(self.Storage._measure_filestore_bytes(), 0)
 
-    def test_filestore_walk_sums_files(self, tmpdir=None):
+    def test_filestore_sums_files_via_du(self, tmpdir=None):
         # Build a synthetic filestore tree under a temp dir.
         import tempfile
 
@@ -68,6 +68,20 @@ class TestStorageMeasurement(StorageTestBase):
                 "odoo.tools.config.filestore", return_value=root,
             ):
                 self.assertEqual(self.Storage._measure_filestore_bytes(), 1234)
+
+    def test_filestore_falls_back_to_os_walk_when_du_missing(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "f1"), "wb") as f:
+                f.write(b"z" * 777)
+            with mock.patch(
+                "odoo.tools.config.filestore", return_value=root,
+            ), mock.patch(
+                "odoo.addons.ikerp_user_limit.models.ikerp_storage.subprocess.run",
+                side_effect=FileNotFoundError(),
+            ):
+                self.assertEqual(self.Storage._measure_filestore_bytes(), 777)
 
 
 class TestStorageTransitions(StorageTestBase):

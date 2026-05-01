@@ -9,6 +9,7 @@ gates ir.attachment writes (see ir_attachment.py).
 import logging
 import math
 import os
+import subprocess
 import time
 from datetime import datetime, timezone
 
@@ -89,6 +90,28 @@ class IkerpStorage(models.AbstractModel):
         path = tools.config.filestore(self.env.cr.dbname)
         if not path or not os.path.isdir(path):
             return 0
+        # Prefer `du -sb` — orders of magnitude faster than os.walk on big
+        # filestores (tens of thousands of files). Fall back to os.walk if du
+        # is missing, slow, or the filesystem rejects it.
+        try:
+            proc = subprocess.run(
+                ["du", "-sb", path],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                return int(proc.stdout.split()[0])
+            _logger.warning(
+                "IKERP storage: du -sb %s returned %s; falling back to os.walk. stderr=%s",
+                path, proc.returncode, proc.stderr[:200],
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, OSError) as exc:
+            _logger.warning(
+                "IKERP storage: du failed (%s); falling back to os.walk for %s.",
+                exc, path,
+            )
         total = 0
         for dirpath, _dirs, files in os.walk(path):
             for fname in files:
