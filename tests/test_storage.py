@@ -23,8 +23,9 @@ class StorageTestBase(TransactionCase):
         )
         self.env_patcher.start()
         self.addCleanup(self.env_patcher.stop)
-        # Clean any prior state from the in-process cache so tests are isolated.
+        # Clean any prior state from the in-process caches so tests are isolated.
         storage_mod._state_cache.clear()
+        storage_mod._pending_growth_bytes.clear()
 
     def _set_limit(self, mb):
         sig = compute_signature(str(mb), SECRET.encode("utf-8"))

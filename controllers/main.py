@@ -7,9 +7,7 @@ from ..models.ikerp_storage import (
     PARAM_BREAKDOWN_DB_MB,
     PARAM_BREAKDOWN_FILESTORE_MB,
     PARAM_LIMIT_MB,
-    PARAM_STATE,
     PARAM_USED_MB,
-    STATE_OK,
 )
 
 
@@ -26,7 +24,9 @@ class IkerpStorageController(http.Controller):
     @http.route("/ikerp/storage/state", type="json", auth="user")
     def storage_state(self):
         env = request.env
-        state = env["ir.config_parameter"].sudo().get_param(PARAM_STATE) or STATE_OK
+        # Verified read: tamper or staleness surfaces as 'blocked' here too,
+        # so the banner stays consistent with the attachment gate.
+        state = env["ikerp.storage"]._read_verified_state()
         used_mb = _int_param(env, PARAM_USED_MB)
         limit_mb = _int_param(env, PARAM_LIMIT_MB)
         db_mb = _int_param(env, PARAM_BREAKDOWN_DB_MB)

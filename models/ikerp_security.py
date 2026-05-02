@@ -42,6 +42,28 @@ def compute_signature(raw_value, secret_bytes):
     ).hexdigest()
 
 
+def set_signed_param(env, param_name, raw_value, sig_param_name=None):
+    """Write `raw_value` and its HMAC signature to ir.config_parameter.
+
+    Used by code paths that own a signed param (e.g. the storage cron persisting
+    its own state). The secret must be present in the env or this raises so the
+    caller doesn't silently store an unsigned value.
+    """
+    sig_param_name = sig_param_name or (param_name + "_sig")
+    secret = get_secret()
+    if not secret:
+        _logger.error(
+            "IKERP signed-param: env var %s is not set; cannot sign %s.",
+            ENV_SIGNING_SECRET, param_name,
+        )
+        raise IkerpSignatureInvalidError("missing secret")
+    raw_str = str(raw_value)
+    sig = compute_signature(raw_str, secret)
+    ICP = env["ir.config_parameter"].sudo()
+    ICP.set_param(param_name, raw_str)
+    ICP.set_param(sig_param_name, sig)
+
+
 def verify_signed_param(env, param_name, sig_param_name=None):
     """Read and HMAC-verify a signed ir.config_parameter.
 

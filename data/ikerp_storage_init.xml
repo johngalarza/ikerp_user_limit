@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!--
+        Runs on every install/upgrade so the signed snapshot
+        (storage_state + storage_last_run_at) exists immediately. Without this,
+        an upgraded tenant would have a raw unsigned storage_state in
+        ir.config_parameter and the verified read would fail-close to blocked
+        until the first 30-min cron tick repopulated and signed it.
+
+        _cron_check_storage swallows exceptions, so a misconfigured env
+        (missing IKERP_SIGNING_SECRET) won't brick the install — the next
+        cron tick will retry.
+    -->
+    <function model="ikerp.storage" name="_cron_check_storage"/>
+</odoo>

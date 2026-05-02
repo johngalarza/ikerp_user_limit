@@ -1,6 +1,6 @@
 {
     "name": "IKERP User Limit",
-    "version": "19.0.1.1.0",
+    "version": "19.0.1.2.0",
     "summary": "Signed per-tenant user cap and storage quota for the IKERP SaaS platform.",
     "description": """
 IKERP User & Storage Limit
@@ -26,6 +26,7 @@ for non-superusers.
     "data": [
         "data/ir_cron.xml",
         "data/mail_template.xml",
+        "data/ikerp_storage_init.xml",
     ],
     "assets": {
         "web.assets_backend": [

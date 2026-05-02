@@ -18,6 +18,7 @@ from odoo import api, models, tools
 from .ikerp_security import (
     IkerpParamMissingError,
     IkerpSignatureError,
+    set_signed_param,
     verify_signed_param,
 )
 
@@ -26,6 +27,7 @@ _logger = logging.getLogger(__name__)
 PARAM_LIMIT_MB = "ikerp.storage_limit_mb"
 PARAM_USED_MB = "ikerp.storage_used_mb"
 PARAM_STATE = "ikerp.storage_state"
+PARAM_LAST_RUN_AT = "ikerp.storage_last_run_at"
 PARAM_BREAKDOWN_DB_MB = "ikerp.storage_db_mb"
 PARAM_BREAKDOWN_FILESTORE_MB = "ikerp.storage_filestore_mb"
 PARAM_ADMIN_EMAIL = "ikerp.admin_email"
@@ -60,14 +62,29 @@ EVENT_FOR_STATE = {
 HTTP_TIMEOUT_SECONDS = 10
 HTTP_RETRY_BACKOFF_SECONDS = 5
 
-# Module-level cache for ir.attachment hot-path reads. Keyed by (dbname,) so a
-# single worker serving multiple DBs stays correct.
+# Cron runs every 30 min. Allow up to ~3 missed ticks before fail-closing the
+# hot path, so transient cron blips (worker restart, long migration) don't
+# falsely block tenants. A disabled or crashed cron crosses this in ~90 min.
+STALENESS_BUDGET_SECONDS = 90 * 60
+LAST_RUN_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+# Module-level cache for ir.attachment hot-path reads. Keyed by dbname so a
+# single worker serving multiple DBs stays correct. Holds the verified state
+# plus the persisted used/limit (in bytes) needed to project growth without
+# re-walking the filestore on every attachment create.
 _STATE_CACHE_TTL_SECONDS = 60
 _state_cache = {}
 
+# Per-process running total of attachment bytes added since the cached snapshot
+# was taken. Lets a single worker estimate "where are we now" between cron ticks
+# without an SQL roundtrip per file. Cross-worker drift is reconciled on the
+# next snapshot refresh — the disk-walk recompute sees every worker's writes
+# regardless of which one made them.
+_pending_growth_bytes = {}
+
 
 def _now_utc_iso():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime(LAST_RUN_TIMESTAMP_FORMAT)
 
 
 def _bytes_to_mb_ceil(n_bytes):
@@ -182,11 +199,77 @@ class IkerpStorage(models.AbstractModel):
     # Persistence
     # ------------------------------------------------------------------
     def _read_state(self):
+        """Raw read of the persisted state, signature-agnostic.
+
+        Used internally to compute prev_state for transition diffing. Hot-path
+        gating must use _read_verified_state instead — that one fail-closes on
+        tampering or cron staleness.
+        """
         return self.env["ir.config_parameter"].sudo().get_param(PARAM_STATE) or STATE_OK
+
+    def _read_verified_state(self):
+        """Return the state to enforce, fail-closing on tampering or staleness.
+
+        Decision tree:
+            * limit param missing             -> STATE_OK (legacy/forward compat).
+            * limit param sig invalid         -> STATE_BLOCKED.
+            * limit OK, state sig invalid     -> STATE_BLOCKED.
+            * limit OK, last_run_at sig bad   -> STATE_BLOCKED.
+            * limit OK, last_run_at too old   -> STATE_BLOCKED (cron disabled/dead).
+            * everything signed and fresh     -> the persisted state.
+
+        Missing state/last_run_at when the limit is configured is treated as
+        tampering: the cron is supposed to populate both on every tick, plus
+        once on install/upgrade via the post-init hook.
+        """
+        try:
+            verify_signed_param(self.env, PARAM_LIMIT_MB)
+        except IkerpParamMissingError:
+            return STATE_OK
+        except IkerpSignatureError:
+            return STATE_BLOCKED
+
+        try:
+            state = verify_signed_param(self.env, PARAM_STATE)
+        except IkerpSignatureError:
+            return STATE_BLOCKED
+        if state not in STATE_RANK:
+            _logger.error("IKERP storage: unknown signed state=%r; blocking.", state)
+            return STATE_BLOCKED
+
+        try:
+            last_run_iso = verify_signed_param(self.env, PARAM_LAST_RUN_AT)
+        except IkerpSignatureError:
+            return STATE_BLOCKED
+        try:
+            last_run = datetime.strptime(
+                last_run_iso, LAST_RUN_TIMESTAMP_FORMAT,
+            ).replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            _logger.error(
+                "IKERP storage: last_run_at=%r is not parseable; blocking.",
+                last_run_iso,
+            )
+            return STATE_BLOCKED
+
+        age = (datetime.now(timezone.utc) - last_run).total_seconds()
+        if age > STALENESS_BUDGET_SECONDS:
+            _logger.warning(
+                "IKERP storage: last_run_at is stale (%.0fs > %ds); "
+                "fail-closing to blocked. Cron disabled or stuck?",
+                age, STALENESS_BUDGET_SECONDS,
+            )
+            return STATE_BLOCKED
+
+        return state
 
     def _write_snapshot(self, state, used_mb, db_mb, filestore_mb):
         ICP = self.env["ir.config_parameter"].sudo()
-        ICP.set_param(PARAM_STATE, state)
+        # State and last_run_at are HMAC-signed: editing either via debug breaks
+        # the signature, and a stopped cron lets last_run_at age past the
+        # staleness budget — both paths fail-close to blocked.
+        set_signed_param(self.env, PARAM_STATE, state)
+        set_signed_param(self.env, PARAM_LAST_RUN_AT, _now_utc_iso())
         ICP.set_param(PARAM_USED_MB, str(used_mb))
         ICP.set_param(PARAM_BREAKDOWN_DB_MB, str(db_mb))
         ICP.set_param(PARAM_BREAKDOWN_FILESTORE_MB, str(filestore_mb))
@@ -394,23 +477,96 @@ class IkerpStorage(models.AbstractModel):
     # Cache helpers (used by ir.attachment fast path)
     # ------------------------------------------------------------------
     def _invalidate_state_cache(self):
-        _state_cache.pop(self.env.cr.dbname, None)
+        dbname = self.env.cr.dbname
+        _state_cache.pop(dbname, None)
+        # Snapshot just changed (du -sb walked the disk and now reflects every
+        # worker's writes), so this worker's pending-bytes estimate is stale.
+        _pending_growth_bytes.pop(dbname, None)
 
-    @api.model
-    def _get_cached_state(self):
-        """Return the current storage state with a short TTL cache.
+    def _get_snapshot(self):
+        """Return cached {state, used_bytes, limit_bytes} for the hot path.
 
-        ir.attachment.create/write hits this on every call, so we avoid hammering
-        ir.config_parameter. Cache is invalidated on every recompute.
+        Refreshed on TTL expiry or invalidation. Uses the fail-closed verified
+        read so tampering or cron staleness surfaces as STATE_BLOCKED within at
+        most _STATE_CACHE_TTL_SECONDS. limit_bytes is 0 when the limit is
+        unconfigured or invalid — callers must treat that as "skip projection"
+        and rely on the verified state alone.
         """
         dbname = self.env.cr.dbname
         cached = _state_cache.get(dbname)
         now = time.monotonic()
-        if cached and cached[1] > now:
-            return cached[0]
-        state = self._read_state()
-        _state_cache[dbname] = (state, now + _STATE_CACHE_TTL_SECONDS)
-        return state
+        if cached and cached["expires_at"] > now:
+            return cached
+        ICP = self.env["ir.config_parameter"].sudo()
+        limit_mb, status = self._get_signed_limit_mb()
+        limit_bytes = limit_mb * 1024 * 1024 if status == "ok" and limit_mb else 0
+        try:
+            used_mb = int(ICP.get_param(PARAM_USED_MB) or 0)
+        except (TypeError, ValueError):
+            used_mb = 0
+        snap = {
+            "state": self._read_verified_state(),
+            "used_bytes": used_mb * 1024 * 1024,
+            "limit_bytes": limit_bytes,
+            "expires_at": now + _STATE_CACHE_TTL_SECONDS,
+        }
+        _state_cache[dbname] = snap
+        # Fresh snapshot already reflects every worker's writes, so reset the
+        # per-worker estimate.
+        _pending_growth_bytes[dbname] = 0
+        return snap
+
+    @api.model
+    def _get_cached_state(self):
+        """Return the current verified storage state with a short TTL cache."""
+        return self._get_snapshot()["state"]
+
+    @api.model
+    def _check_attachment_growth(self, payload_bytes):
+        """Project usage and decide whether this attachment growth must block.
+
+        Returns True iff the caller should raise. Called from ir.attachment
+        create/write before super(). Workflow:
+
+            1. If cached state is already BLOCKED, block (existing behavior).
+            2. Without a configured limit, skip projection — only the verified
+               state gates writes.
+            3. Otherwise project: persisted_used + per-worker pending + this
+               payload. If the projection crosses a threshold above the cached
+               state, run a synchronous recompute_and_dispatch (du -sb walks
+               the disk, refreshes persisted snapshot, dispatches alerts).
+            4. After recompute, re-project against the fresh persisted value.
+               Block iff the projection still lands at BLOCKED — the new file
+               isn't on disk yet, so we can't trust the recomputed state alone
+               for the gate decision.
+            5. If we did not trigger a recompute, accumulate pending bytes so
+               subsequent calls see this file's contribution.
+        """
+        snap = self._get_snapshot()
+        if snap["state"] == STATE_BLOCKED:
+            return True
+        if snap["limit_bytes"] <= 0:
+            return False
+        dbname = self.env.cr.dbname
+        pending = _pending_growth_bytes.get(dbname, 0)
+        projected = snap["used_bytes"] + pending + payload_bytes
+        projected_state = self._state_for(projected / float(snap["limit_bytes"]))
+        if STATE_RANK[projected_state] > STATE_RANK[snap["state"]]:
+            self.recompute_and_dispatch()
+            snap = self._get_snapshot()
+            if snap["state"] == STATE_BLOCKED:
+                return True
+            if snap["limit_bytes"] <= 0:
+                return False
+            # Re-project against fresh persisted; pending was reset by the
+            # invalidation triggered inside recompute_and_dispatch.
+            projected = snap["used_bytes"] + payload_bytes
+            if self._state_for(projected / float(snap["limit_bytes"])) == STATE_BLOCKED:
+                return True
+            _pending_growth_bytes[dbname] = payload_bytes
+            return False
+        _pending_growth_bytes[dbname] = pending + payload_bytes
+        return False
 
     # ------------------------------------------------------------------
     # Cron entry point
